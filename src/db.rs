@@ -56,6 +56,27 @@ impl Database {
     vec_mult_u32_u32(row, &self.entries[col_idx]).unwrap()
   }
 
+  pub fn vec_mult_batched(
+    &self,
+    q1: &[u32],
+    q2: &[u32],
+    col_idx: usize,
+  ) -> (u32, u32) {
+    let col = &self.entries[col_idx];
+    let mut acc1 = 0u32;
+    let mut acc2 = 0u32;
+
+    // Zipping the iterators allows the LLVM compiler to easily auto-vectorize this
+    // into SIMD instructions, loading the DB column `c` once from cache
+    // and multiplying it by both query elements simultaneously.
+    for ((&x1, &x2), &c) in q1.iter().zip(q2.iter()).zip(col.iter()) {
+      acc1 = acc1.wrapping_add(x1.wrapping_mul(c));
+      acc2 = acc2.wrapping_add(x2.wrapping_mul(c));
+    }
+
+    (acc1, acc2)
+  }
+
   pub fn write_to_file(&self, path: &str) -> ResultBoxedError<()> {
     let json = json!(self.entries);
     Ok(serde_json::to_writer(&fs::File::create(path)?, &json)?)

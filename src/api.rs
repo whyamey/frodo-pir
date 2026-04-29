@@ -76,6 +76,30 @@ impl Shard {
     Ok(ser?)
   }
 
+  /// Produces a serialized response (base64-encoded) to two simultaneous
+  pub fn respond_batched(
+    &self,
+    bq: &BatchedQuery,
+  ) -> ResultBoxedError<Vec<u8>> {
+    let q1_slice = bq.q1.as_slice();
+    let q2_slice = bq.q2.as_slice();
+
+    let width = self.db.get_matrix_width_self();
+    let mut r1 = Vec::with_capacity(width);
+    let mut r2 = Vec::with_capacity(width);
+
+    for i in 0..width {
+      let (res1, res2) = self.db.vec_mult_batched(q1_slice, q2_slice, i);
+      r1.push(res1);
+      r2.push(res2);
+    }
+
+    let resp = BatchedResponse { r1, r2 };
+    let ser = bincode::serialize(&resp);
+
+    Ok(ser?)
+  }
+
   /// Returns the database
   pub fn get_db(&self) -> &Database {
     &self.db
@@ -150,6 +174,13 @@ impl Query {
   }
 }
 
+/// The `BatchedQuery` struct holds two client PIR queries to be processed at once.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BatchedQuery {
+  pub q1: Vec<u32>,
+  pub q2: Vec<u32>,
+}
+
 /// The `Response` object wraps a response from a single shard
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Response(Vec<u32>);
@@ -191,6 +222,13 @@ impl Response {
     let row = self.parse_output_as_row(qp);
     base64_from_u32_slice(&row, qp.plaintext_bits, qp.elem_size)
   }
+}
+
+/// The `BatchedResponse` object wraps the responses for two simultaneous queries.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct BatchedResponse {
+  pub r1: Vec<u32>,
+  pub r2: Vec<u32>,
 }
 
 #[cfg(test)]
@@ -272,5 +310,71 @@ mod tests {
       elems.push(elem_str);
     }
     elems
+  }
+
+  #[test]
+  fn benchmark_batched_vs_sequential() {
+    use std::time::Instant;
+
+    let m = 2u32.pow(20) as usize;
+    let elem_size = 2u32.pow(13) as usize;
+    let plaintext_bits = 10usize;
+    let lwe_dim = 1572;
+
+    println!("Generating DB...");
+    let db_elems = generate_db_elems(m, (elem_size + 7) / 8);
+    let shard = Shard::from_base64_strings(
+      &db_elems,
+      lwe_dim,
+      m,
+      elem_size,
+      plaintext_bits,
+    )
+    .unwrap();
+
+    let bp = shard.get_base_params();
+    let cp = CommonParams::from(bp);
+
+    let mut qp1 = QueryParams::new(&cp, bp).unwrap();
+    let mut qp2 = QueryParams::new(&cp, bp).unwrap();
+    let q1 = qp1.generate_query(0).unwrap();
+    let q2 = qp2.generate_query(1).unwrap();
+
+    let batched_q = BatchedQuery {
+      q1: q1.as_slice().to_vec(),
+      q2: q2.as_slice().to_vec(),
+    };
+
+    let _ = shard.respond(&q1).unwrap();
+    let _ = shard.respond_batched(&batched_q).unwrap();
+
+    let iterations = 20;
+
+    // Time Sequential Queries
+    let start_seq = Instant::now();
+    for _ in 0..iterations {
+      let _ = shard.respond(&q1).unwrap();
+      let _ = shard.respond(&q2).unwrap();
+    }
+    let duration_seq = start_seq.elapsed();
+
+    // Time Batched Queries
+    let start_batched = Instant::now();
+    for _ in 0..iterations {
+      let _ = shard.respond_batched(&batched_q).unwrap();
+    }
+    let duration_batched = start_batched.elapsed();
+
+    println!("--------------------------------------------------");
+    println!("Performance Results ({} iterations):", iterations);
+    println!("Sequential (2 separate requests): {:?}", duration_seq);
+    println!("Batched (1 combined request):     {:?}", duration_batched);
+    println!(
+      "Speedup multiplier: {:.2}x",
+      duration_seq.as_secs_f64() / duration_batched.as_secs_f64()
+    );
+    println!("--------------------------------------------------");
+
+    assert!(duration_batched < duration_seq);
   }
 }
