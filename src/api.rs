@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::str;
 
+use rayon::prelude::*; 
+
 /// A `Shard` is an instance of a database, where each row corresponds
 /// to a single element, that has been preprocessed by the server.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -107,13 +109,18 @@ impl Shard {
   ) -> ResultBoxedError<Vec<u8>> {
     let width = self.db.get_matrix_width_self();
 
+    // Rayon automatically splits the columns across your CPU cores!
+    let results: Vec<[u32; 4]> = (0..width)
+      .into_par_iter()
+      .map(|i| self.db.vec_mult_batched_4(&bq.interleaved, i))
+      .collect();
+
     let mut r1 = Vec::with_capacity(width);
     let mut r2 = Vec::with_capacity(width);
     let mut r3 = Vec::with_capacity(width);
     let mut r4 = Vec::with_capacity(width);
 
-    for i in 0..width {
-      let res = self.db.vec_mult_batched_4(&bq.interleaved, i);
+    for res in results {
       r1.push(res[0]);
       r2.push(res[1]);
       r3.push(res[2]);
@@ -423,7 +430,7 @@ mod tests {
   fn benchmark_batched_4_vs_sequential() {
     use std::time::Instant;
 
-    let m = 2u32.pow(20) as usize;
+    let m = 2u32.pow(18) as usize;
     let elem_size = 2u32.pow(13) as usize;
     let plaintext_bits = 10usize;
     let lwe_dim = 1572;
