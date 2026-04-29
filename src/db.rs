@@ -27,7 +27,7 @@ impl Database {
   ) -> ResultBoxedError<Self> {
     let rows = construct_rows(elements, m, elem_size, plaintext_bits)?;
     let width = if rows.is_empty() { 0 } else { rows[0].len() };
-    
+
     Ok(Self {
       entries: flatten_matrix_col_major(&rows),
       m,
@@ -54,13 +54,14 @@ impl Database {
     vec_mult_u32_u32(row, col).unwrap()
   }
 
- /// Batched matrix multiplication optimized for LLVM auto-vectorization
-  pub fn vec_mult_batched(
+  /// Generic batched matrix multiplication for N interleaved queries.
+  /// Because N is a compile-time constant, LLVM will hopefully unroll
+  /// the inner loop and auto-vectorize it to AVX/NEON instructions.
+  pub fn vec_mult_batched_n<const N: usize>(
     &self,
-    q1: &[u32],
-    q2: &[u32],
+    q_interleaved: &[[u32; N]],
     col_idx: usize,
-  ) -> (u32, u32) {
+  ) -> [u32; N] {
     // Extract the contiguous column slice
     let start = col_idx * self.m;
     let col = &self.entries[start..start + self.m];
@@ -69,53 +70,23 @@ impl Database {
     // By asserting equal lengths upfront, we prove to the compiler that
     // bounds checking inside the loop is unnecessary. LLVM will strip
     // the safety checks and unroll this into pure AVX/NEON instructions.
-    assert_eq!(q1.len(), len);
-    assert_eq!(q2.len(), len);
-
-    let mut acc1 = 0u32;
-    let mut acc2 = 0u32;
-
-  // A flat indexed loop for easy auto-vec
-    for i in 0..len {
-      let c = col[i];
-      acc1 = acc1.wrapping_add(q1[i].wrapping_mul(c));
-      acc2 = acc2.wrapping_add(q2[i].wrapping_mul(c));
-    }
-
-    (acc1, acc2)
-  }
-
- /// Batched matrix multiplication for 4 interleaved queries with
- /// [u32; 4] to force 128-bit alignment.
-  pub fn vec_mult_batched_4(
-    &self,
-    q_interleaved: &[[u32; 4]],
-    col_idx: usize,
-  ) -> [u32; 4] {
-    // Extract the contiguous column slice
-    let start = col_idx * self.m;
-    let col = &self.entries[start..start + self.m];
-    let len = col.len();
-
-    // Zero-bound check
     assert_eq!(q_interleaved.len(), len);
 
-    let mut acc = [0u32; 4];
+    let mut acc = [0u32; N];
 
     for i in 0..len {
       let c = col[i];
       let q = q_interleaved[i];
 
-     // Hopefully LLVM auto translates this to vector multiply-add
-      acc[0] = acc[0].wrapping_add(q[0].wrapping_mul(c));
-      acc[1] = acc[1].wrapping_add(q[1].wrapping_mul(c));
-      acc[2] = acc[2].wrapping_add(q[2].wrapping_mul(c));
-      acc[3] = acc[3].wrapping_add(q[3].wrapping_mul(c));
+      // Hopefully LLVM auto translates this to vector multiply-add
+      for j in 0..N {
+        acc[j] = acc[j].wrapping_add(q[j].wrapping_mul(c));
+      }
     }
 
     acc
   }
-  
+
   pub fn write_to_file(&self, path: &str) -> ResultBoxedError<()> {
     let mut entries_2d = Vec::with_capacity(self.width);
     for col in 0..self.width {
@@ -134,14 +105,10 @@ impl Database {
     }
     row
   }
-  
+
   /// Returns the ith DB entry as a base64-encoded string
   pub fn get_db_entry(&self, i: usize) -> String {
-    base64_from_u32_slice(
-      &self.get_row(i),
-      self.plaintext_bits,
-      self.elem_size,
-    )
+    base64_from_u32_slice(&self.get_row(i), self.plaintext_bits, self.elem_size)
   }
 
   /// Returns the width of the DB matrix
@@ -157,7 +124,7 @@ impl Database {
   pub fn get_matrix_width_self(&self) -> usize {
     self.width
   }
-  
+
   /// Get the matrix size
   pub fn get_matrix_height(&self) -> usize {
     self.m
