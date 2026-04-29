@@ -56,6 +56,7 @@ impl Database {
     vec_mult_u32_u32(row, &self.entries[col_idx]).unwrap()
   }
 
+  /// Batched matrix multiplication optimized for LLVM auto-vectorization
   pub fn vec_mult_batched(
     &self,
     q1: &[u32],
@@ -63,18 +64,54 @@ impl Database {
     col_idx: usize,
   ) -> (u32, u32) {
     let col = &self.entries[col_idx];
+    let len = col.len();
+
+    // By asserting equal lengths upfront, we prove to the compiler that
+    // bounds checking inside the loop is unnecessary. LLVM will strip
+    // the safety checks and unroll this into pure AVX/NEON instructions.
+    assert_eq!(q1.len(), len);
+    assert_eq!(q2.len(), len);
+
     let mut acc1 = 0u32;
     let mut acc2 = 0u32;
 
-    // Zipping the iterators allows the LLVM compiler to easily auto-vectorize this
-    // into SIMD instructions, loading the DB column `c` once from cache
-    // and multiplying it by both query elements simultaneously.
-    for ((&x1, &x2), &c) in q1.iter().zip(q2.iter()).zip(col.iter()) {
-      acc1 = acc1.wrapping_add(x1.wrapping_mul(c));
-      acc2 = acc2.wrapping_add(x2.wrapping_mul(c));
+    // A flat, indexed loop is the exact pattern the LLVM vectorizer looks for.
+    for i in 0..len {
+      let c = col[i];
+      acc1 = acc1.wrapping_add(q1[i].wrapping_mul(c));
+      acc2 = acc2.wrapping_add(q2[i].wrapping_mul(c));
     }
 
     (acc1, acc2)
+  }
+
+  /// Batched matrix multiplication for 4 interleaved queries.
+  /// The memory layout [u32; 4] forces 128-bit NEON alignment.
+  pub fn vec_mult_batched_4(
+    &self,
+    q_interleaved: &[[u32; 4]],
+    col_idx: usize,
+  ) -> [u32; 4] {
+    let col = &self.entries[col_idx];
+    let len = col.len();
+
+    // Zero bounds-checks inside the loop
+    assert_eq!(q_interleaved.len(), len);
+
+    let mut acc = [0u32; 4];
+
+    for i in 0..len {
+      let c = col[i];
+      let q = q_interleaved[i];
+
+      // The compiler translates this hopefully? directly to a vector multiply-add
+      acc[0] = acc[0].wrapping_add(q[0].wrapping_mul(c));
+      acc[1] = acc[1].wrapping_add(q[1].wrapping_mul(c));
+      acc[2] = acc[2].wrapping_add(q[2].wrapping_mul(c));
+      acc[3] = acc[3].wrapping_add(q[3].wrapping_mul(c));
+    }
+
+    acc
   }
 
   pub fn write_to_file(&self, path: &str) -> ResultBoxedError<()> {

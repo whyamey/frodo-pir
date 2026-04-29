@@ -100,6 +100,32 @@ impl Shard {
     Ok(ser?)
   }
 
+  /// Produces a serialized response to 4 interleaved queries simultaneously.
+  pub fn respond_batched_4(
+    &self,
+    bq: &BatchedQuery4,
+  ) -> ResultBoxedError<Vec<u8>> {
+    let width = self.db.get_matrix_width_self();
+
+    let mut r1 = Vec::with_capacity(width);
+    let mut r2 = Vec::with_capacity(width);
+    let mut r3 = Vec::with_capacity(width);
+    let mut r4 = Vec::with_capacity(width);
+
+    for i in 0..width {
+      let res = self.db.vec_mult_batched_4(&bq.interleaved, i);
+      r1.push(res[0]);
+      r2.push(res[1]);
+      r3.push(res[2]);
+      r4.push(res[3]);
+    }
+
+    let resp = BatchedResponse4 { r1, r2, r3, r4 };
+    let ser = bincode::serialize(&resp);
+
+    Ok(ser?)
+  }
+
   /// Returns the database
   pub fn get_db(&self) -> &Database {
     &self.db
@@ -181,6 +207,12 @@ pub struct BatchedQuery {
   pub q2: Vec<u32>,
 }
 
+/// The `BatchedQuery4` struct holds 4 interleaved client PIR queries.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BatchedQuery4 {
+  pub interleaved: Vec<[u32; 4]>,
+}
+
 /// The `Response` object wraps a response from a single shard
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Response(Vec<u32>);
@@ -224,11 +256,20 @@ impl Response {
   }
 }
 
-/// The `BatchedResponse` object wraps the responses for two simultaneous queries.
+/// The `BatchedResponse` object wraps the responses for two queries.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct BatchedResponse {
   pub r1: Vec<u32>,
   pub r2: Vec<u32>,
+}
+
+/// The `BatchedResponse4` object wraps the responses for 4 queries.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct BatchedResponse4 {
+  pub r1: Vec<u32>,
+  pub r2: Vec<u32>,
+  pub r3: Vec<u32>,
+  pub r4: Vec<u32>,
 }
 
 #[cfg(test)]
@@ -369,6 +410,88 @@ mod tests {
     println!("Performance Results ({} iterations):", iterations);
     println!("Sequential (2 separate requests): {:?}", duration_seq);
     println!("Batched (1 combined request):     {:?}", duration_batched);
+    println!(
+      "Speedup multiplier: {:.2}x",
+      duration_seq.as_secs_f64() / duration_batched.as_secs_f64()
+    );
+    println!("--------------------------------------------------");
+
+    assert!(duration_batched < duration_seq);
+  }
+
+  #[test]
+  fn benchmark_batched_4_vs_sequential() {
+    use std::time::Instant;
+
+    let m = 2u32.pow(20) as usize;
+    let elem_size = 2u32.pow(13) as usize;
+    let plaintext_bits = 10usize;
+    let lwe_dim = 1572;
+
+    println!("Generating DB...");
+    let db_elems = generate_db_elems(m, (elem_size + 7) / 8);
+    let shard = Shard::from_base64_strings(
+      &db_elems,
+      lwe_dim,
+      m,
+      elem_size,
+      plaintext_bits,
+    )
+    .unwrap();
+
+    let bp = shard.get_base_params();
+    let cp = CommonParams::from(bp);
+
+    let mut qp1 = QueryParams::new(&cp, bp).unwrap();
+    let mut qp2 = QueryParams::new(&cp, bp).unwrap();
+    let mut qp3 = QueryParams::new(&cp, bp).unwrap();
+    let mut qp4 = QueryParams::new(&cp, bp).unwrap();
+
+    let q1 = qp1.generate_query(0).unwrap();
+    let q2 = qp2.generate_query(1).unwrap();
+    let q3 = qp3.generate_query(2).unwrap();
+    let q4 = qp4.generate_query(3).unwrap();
+
+    let q1_slice = q1.as_slice();
+    let q2_slice = q2.as_slice();
+    let q3_slice = q3.as_slice();
+    let q4_slice = q4.as_slice();
+
+    let interleave_start = Instant::now();
+    let mut interleaved = vec![[0u32; 4]; m];
+    for i in 0..m {
+      interleaved[i] = [q1_slice[i], q2_slice[i], q3_slice[i], q4_slice[i]];
+    }
+    let bq4 = BatchedQuery4 { interleaved };
+    println!(
+      "Time to interleave memory: {:?}",
+      interleave_start.elapsed()
+    );
+
+    let iterations = 10;
+
+    let start_seq = Instant::now();
+    for _ in 0..iterations {
+      let _ = shard.respond(&q1).unwrap();
+      let _ = shard.respond(&q2).unwrap();
+      let _ = shard.respond(&q3).unwrap();
+      let _ = shard.respond(&q4).unwrap();
+    }
+    let duration_seq = start_seq.elapsed();
+
+    let start_batched = Instant::now();
+    for _ in 0..iterations {
+      let _ = shard.respond_batched_4(&bq4).unwrap();
+    }
+    let duration_batched = start_batched.elapsed();
+
+    println!("--------------------------------------------------");
+    println!(
+      "Performance Results ({} iterations of 4 queries):",
+      iterations
+    );
+    println!("Sequential (4 separate loops): {:?}", duration_seq);
+    println!("Interleaved Batched (1 loop):  {:?}", duration_batched);
     println!(
       "Speedup multiplier: {:.2}x",
       duration_seq.as_secs_f64() / duration_batched.as_secs_f64()
