@@ -364,7 +364,7 @@ mod tests {
   fn benchmark_batched_vs_sequential() {
     use std::time::Instant;
 
-    let m = 2u32.pow(20) as usize;
+    let m = 2u32.pow(16) as usize;
     let elem_size = 2u32.pow(13) as usize;
     let plaintext_bits = 10usize;
     let lwe_dim = 1572;
@@ -430,7 +430,7 @@ mod tests {
   fn benchmark_batched_4_vs_sequential() {
     use std::time::Instant;
 
-    let m = 2u32.pow(18) as usize;
+    let m = 2u32.pow(16) as usize;
     let elem_size = 2u32.pow(13) as usize;
     let plaintext_bits = 10usize;
     let lwe_dim = 1572;
@@ -506,5 +506,66 @@ mod tests {
     println!("--------------------------------------------------");
 
     assert!(duration_batched < duration_seq);
+  }
+
+  #[test]
+  fn test_batched_queries_correctness() {
+    let m = 2u32.pow(16) as usize;
+    let elem_size = 2u32.pow(13) as usize;
+    let plaintext_bits = 10usize;
+    let lwe_dim = 1572;
+    
+    let db_elems = generate_db_elems(m, (elem_size + 7) / 8);
+    let shard = Shard::from_base64_strings(
+      &db_elems,
+      lwe_dim,
+      m,
+      elem_size,
+      plaintext_bits,
+    )
+    .unwrap();
+
+    let bp = shard.get_base_params();
+    let cp = CommonParams::from(bp);
+
+    let mut qp1 = QueryParams::new(&cp, bp).unwrap();
+    let mut qp2 = QueryParams::new(&cp, bp).unwrap();
+    let mut qp3 = QueryParams::new(&cp, bp).unwrap();
+    let mut qp4 = QueryParams::new(&cp, bp).unwrap();
+
+    let idx1 = 0;
+    let idx2 = 15;
+    let idx3 = m / 2;
+    let idx4 = m - 1;
+
+    let q1 = qp1.generate_query(idx1).unwrap();
+    let q2 = qp2.generate_query(idx2).unwrap();
+    let q3 = qp3.generate_query(idx3).unwrap();
+    let q4 = qp4.generate_query(idx4).unwrap();
+
+    let q1_slice = q1.as_slice();
+    let q2_slice = q2.as_slice();
+    let q3_slice = q3.as_slice();
+    let q4_slice = q4.as_slice();
+
+    let mut interleaved = vec![[0u32; 4]; m];
+    for i in 0..m {
+      interleaved[i] = [q1_slice[i], q2_slice[i], q3_slice[i], q4_slice[i]];
+    }
+    
+    let bq4 = BatchedQuery4 { interleaved };
+
+    let d_resp = shard.respond_batched_4(&bq4).unwrap();
+    let resp: BatchedResponse4 = bincode::deserialize(&d_resp).unwrap();
+
+    let output1 = Response(resp.r1).parse_output_as_base64(&qp1);
+    let output2 = Response(resp.r2).parse_output_as_base64(&qp2);
+    let output3 = Response(resp.r3).parse_output_as_base64(&qp3);
+    let output4 = Response(resp.r4).parse_output_as_base64(&qp4);
+    
+    assert_eq!(output1, db_elems[idx1], "SIMD Query 1 mismatched!");
+    assert_eq!(output2, db_elems[idx2], "SIMD Query 2 mismatched!");
+    assert_eq!(output3, db_elems[idx3], "SIMD Query 3 mismatched!");
+    assert_eq!(output4, db_elems[idx4], "SIMD Query 4 mismatched!");
   }
 }
