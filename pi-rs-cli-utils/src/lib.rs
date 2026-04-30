@@ -1,4 +1,4 @@
-use clap::{arg, Parser};
+use clap::Parser;
 use std::env;
 use std::num::ParseIntError;
 

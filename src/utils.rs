@@ -44,12 +44,6 @@ pub mod matrices {
     swapped_row
   }
 
-  /// Takes a matrix and returns the [*][i] elements
-  /// equivalent to `swap_matrix_fmt(xys)[i]`, but much faster
-  pub fn get_matrix_second_at(matrix: &[Vec<u32>], secidx: usize) -> Vec<u32> {
-    matrix.iter().map(|y| y[secidx]).collect()
-  }
-
   /// Generates an LWE matrix from a public seed
   /// This corresponds to the generation of `A` in the paper.
   pub fn generate_lwe_matrix_from_seed(
@@ -132,6 +126,22 @@ pub mod matrices {
       row.push(random_ternary());
     }
     row
+  }
+
+  /// Takes a matrix in row format, and returns it flattened in column-major format
+  pub fn flatten_matrix_col_major(matrix: &[Vec<u32>]) -> Vec<u32> {
+    if matrix.is_empty() { return Vec::new(); }
+    let height = matrix.len();
+    let width = matrix[0].len();
+    
+    let mut flat = Vec::with_capacity(height * width);
+    
+    for col in 0..width {
+      for row in 0..height {
+        flat.push(matrix[row][col]);
+      }
+    }
+    flat
   }
 }
 

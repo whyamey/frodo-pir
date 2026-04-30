@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::str;
 
+use rayon::prelude::*;
+
 /// A `Shard` is an instance of a database, where each row corresponds
 /// to a single element, that has been preprocessed by the server.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -71,56 +73,6 @@ impl Shard {
         .map(|i| self.db.vec_mult(q, i))
         .collect(),
     );
-    let ser = bincode::serialize(&resp);
-
-    Ok(ser?)
-  }
-
-  /// Produces a serialized response (base64-encoded) to two simultaneous
-  pub fn respond_batched(
-    &self,
-    bq: &BatchedQuery,
-  ) -> ResultBoxedError<Vec<u8>> {
-    let q1_slice = bq.q1.as_slice();
-    let q2_slice = bq.q2.as_slice();
-
-    let width = self.db.get_matrix_width_self();
-    let mut r1 = Vec::with_capacity(width);
-    let mut r2 = Vec::with_capacity(width);
-
-    for i in 0..width {
-      let (res1, res2) = self.db.vec_mult_batched(q1_slice, q2_slice, i);
-      r1.push(res1);
-      r2.push(res2);
-    }
-
-    let resp = BatchedResponse { r1, r2 };
-    let ser = bincode::serialize(&resp);
-
-    Ok(ser?)
-  }
-
-  /// Produces a serialized response to 4 interleaved queries simultaneously.
-  pub fn respond_batched_4(
-    &self,
-    bq: &BatchedQuery4,
-  ) -> ResultBoxedError<Vec<u8>> {
-    let width = self.db.get_matrix_width_self();
-
-    let mut r1 = Vec::with_capacity(width);
-    let mut r2 = Vec::with_capacity(width);
-    let mut r3 = Vec::with_capacity(width);
-    let mut r4 = Vec::with_capacity(width);
-
-    for i in 0..width {
-      let res = self.db.vec_mult_batched_4(&bq.interleaved, i);
-      r1.push(res[0]);
-      r2.push(res[1]);
-      r3.push(res[2]);
-      r4.push(res[3]);
-    }
-
-    let resp = BatchedResponse4 { r1, r2, r3, r4 };
     let ser = bincode::serialize(&resp);
 
     Ok(ser?)
@@ -200,19 +152,6 @@ impl Query {
   }
 }
 
-/// The `BatchedQuery` struct holds two client PIR queries to be processed at once.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BatchedQuery {
-  pub q1: Vec<u32>,
-  pub q2: Vec<u32>,
-}
-
-/// The `BatchedQuery4` struct holds 4 interleaved client PIR queries.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BatchedQuery4 {
-  pub interleaved: Vec<[u32; 4]>,
-}
-
 /// The `Response` object wraps a response from a single shard
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Response(Vec<u32>);
@@ -256,21 +195,48 @@ impl Response {
   }
 }
 
-/// The `BatchedResponse` object wraps the responses for two queries.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct BatchedResponse {
-  pub r1: Vec<u32>,
-  pub r2: Vec<u32>,
+/// Macro to generate structs and method for generic batching
+/// The `BatchedQuery` struct holds interleaved client PIR queries.
+/// The `BatchedResponse` object wraps the responses for client queries.
+/// Produces a serialized response to interleaved queries simultaneously.
+macro_rules! impl_batched_api {
+  ($n:expr, $query_name:ident, $resp_name:ident, $method_name:ident) => {
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct $query_name {
+      pub interleaved: Vec<[u32; $n]>,
+    }
+
+    #[derive(Clone, Serialize, Deserialize)]
+    pub struct $resp_name {
+      pub results: Vec<[u32; $n]>,
+    }
+
+    impl Shard {
+      pub fn $method_name(
+        &self,
+        bq: &$query_name,
+      ) -> ResultBoxedError<Vec<u8>> {
+        let width = self.db.get_matrix_width_self();
+
+        // Par iterator hopefully splits the columns
+        let results: Vec<[u32; $n]> = (0..width)
+          .into_par_iter()
+          .map(|i| self.db.vec_mult_batched_n::<$n>(&bq.interleaved, i))
+          .collect();
+
+        let resp = $resp_name { results };
+        let ser = bincode::serialize(&resp);
+        Ok(ser?)
+      }
+    }
+  };
 }
 
-/// The `BatchedResponse4` object wraps the responses for 4 queries.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct BatchedResponse4 {
-  pub r1: Vec<u32>,
-  pub r2: Vec<u32>,
-  pub r3: Vec<u32>,
-  pub r4: Vec<u32>,
-}
+impl_batched_api!(2, BatchedQuery2, BatchedResponse2, respond_batched_2);
+impl_batched_api!(4, BatchedQuery4, BatchedResponse4, respond_batched_4);
+impl_batched_api!(8, BatchedQuery8, BatchedResponse8, respond_batched_8);
+impl_batched_api!(16, BatchedQuery16, BatchedResponse16, respond_batched_16);
+impl_batched_api!(32, BatchedQuery32, BatchedResponse32, respond_batched_32);
 
 #[cfg(test)]
 mod tests {
@@ -353,151 +319,133 @@ mod tests {
     elems
   }
 
-  #[test]
-  fn benchmark_batched_vs_sequential() {
-    use std::time::Instant;
+  macro_rules! test_batch_size {
+    ($test_name:ident, $n:expr, $query_type:ident, $resp_type:ident, $method:ident) => {
+      #[test]
+      fn $test_name() {
+        use std::time::Instant;
 
-    let m = 2u32.pow(20) as usize;
-    let elem_size = 2u32.pow(13) as usize;
-    let plaintext_bits = 10usize;
-    let lwe_dim = 1572;
+        let m = 2u32.pow(20) as usize;
+        let elem_size = 2u32.pow(13) as usize;
+        let plaintext_bits = 10usize;
+        let lwe_dim = 1572;
 
-    println!("Generating DB...");
-    let db_elems = generate_db_elems(m, (elem_size + 7) / 8);
-    let shard = Shard::from_base64_strings(
-      &db_elems,
-      lwe_dim,
-      m,
-      elem_size,
-      plaintext_bits,
-    )
-    .unwrap();
+        let db_elems = generate_db_elems(m, (elem_size + 7) / 8);
+        let shard = Shard::from_base64_strings(
+          &db_elems,
+          lwe_dim,
+          m,
+          elem_size,
+          plaintext_bits,
+        )
+        .unwrap();
 
-    let bp = shard.get_base_params();
-    let cp = CommonParams::from(bp);
+        let bp = shard.get_base_params();
+        let cp = CommonParams::from(bp);
 
-    let mut qp1 = QueryParams::new(&cp, bp).unwrap();
-    let mut qp2 = QueryParams::new(&cp, bp).unwrap();
-    let q1 = qp1.generate_query(0).unwrap();
-    let q2 = qp2.generate_query(1).unwrap();
+        let mut qps: Vec<QueryParams> = (0..$n)
+          .map(|_| QueryParams::new(&cp, bp).unwrap())
+          .collect();
 
-    let batched_q = BatchedQuery {
-      q1: q1.as_slice().to_vec(),
-      q2: q2.as_slice().to_vec(),
+        let mut queries = Vec::with_capacity($n);
+        let mut target_indices = Vec::with_capacity($n);
+
+        for i in 0..$n {
+          let idx = (i * (m / $n)) % m;
+          target_indices.push(idx);
+          queries.push(qps[i].generate_query(idx).unwrap());
+        }
+
+        let mut interleaved = vec![[0u32; $n]; m];
+        for row in 0..m {
+          for j in 0..$n {
+            interleaved[row][j] = queries[j].as_slice()[row];
+          }
+        }
+
+        let bq = super::$query_type { interleaved };
+
+        let iterations = 10;
+
+        let _ = shard.respond(&queries[0]).unwrap();
+        let _ = shard.$method(&bq).unwrap();
+
+        let start_seq = Instant::now();
+        for _ in 0..iterations {
+          for i in 0..$n {
+            let _ = shard.respond(&queries[i]).unwrap();
+          }
+        }
+        let duration_seq = start_seq.elapsed();
+
+        let start_batched = Instant::now();
+        for _ in 0..iterations {
+          let _ = shard.$method(&bq).unwrap();
+        }
+        let duration_batched = start_batched.elapsed();
+
+        println!("\n--------------------------------------------------");
+        println!(
+          "Performance Results for Batch Size {} ({} iterations):",
+          $n, iterations
+        );
+        println!("Sequential ({} separate requests): {:?}", $n, duration_seq);
+        println!("Interleaved Batched (1 request):   {:?}", duration_batched);
+        println!(
+          "Speedup multiplier: {:.2}x",
+          duration_seq.as_secs_f64() / duration_batched.as_secs_f64()
+        );
+        println!("--------------------------------------------------");
+
+        let d_resp = shard.$method(&bq).unwrap();
+        let resp: super::$resp_type = bincode::deserialize(&d_resp).unwrap();
+        let width = shard.get_db().get_matrix_width_self();
+
+        for j in 0..$n {
+          let mut single_resp = Vec::with_capacity(width);
+          for w in 0..width {
+            single_resp.push(resp.results[w][j]);
+          }
+          let output = Response(single_resp).parse_output_as_base64(&qps[j]);
+          assert_eq!(output, db_elems[target_indices[j]]);
+        }
+      }
     };
-
-    let _ = shard.respond(&q1).unwrap();
-    let _ = shard.respond_batched(&batched_q).unwrap();
-
-    let iterations = 20;
-
-    // Time Sequential Queries
-    let start_seq = Instant::now();
-    for _ in 0..iterations {
-      let _ = shard.respond(&q1).unwrap();
-      let _ = shard.respond(&q2).unwrap();
-    }
-    let duration_seq = start_seq.elapsed();
-
-    // Time Batched Queries
-    let start_batched = Instant::now();
-    for _ in 0..iterations {
-      let _ = shard.respond_batched(&batched_q).unwrap();
-    }
-    let duration_batched = start_batched.elapsed();
-
-    println!("--------------------------------------------------");
-    println!("Performance Results ({} iterations):", iterations);
-    println!("Sequential (2 separate requests): {:?}", duration_seq);
-    println!("Batched (1 combined request):     {:?}", duration_batched);
-    println!(
-      "Speedup multiplier: {:.2}x",
-      duration_seq.as_secs_f64() / duration_batched.as_secs_f64()
-    );
-    println!("--------------------------------------------------");
-
-    assert!(duration_batched < duration_seq);
   }
 
-  #[test]
-  fn benchmark_batched_4_vs_sequential() {
-    use std::time::Instant;
-
-    let m = 2u32.pow(20) as usize;
-    let elem_size = 2u32.pow(13) as usize;
-    let plaintext_bits = 10usize;
-    let lwe_dim = 1572;
-
-    println!("Generating DB...");
-    let db_elems = generate_db_elems(m, (elem_size + 7) / 8);
-    let shard = Shard::from_base64_strings(
-      &db_elems,
-      lwe_dim,
-      m,
-      elem_size,
-      plaintext_bits,
-    )
-    .unwrap();
-
-    let bp = shard.get_base_params();
-    let cp = CommonParams::from(bp);
-
-    let mut qp1 = QueryParams::new(&cp, bp).unwrap();
-    let mut qp2 = QueryParams::new(&cp, bp).unwrap();
-    let mut qp3 = QueryParams::new(&cp, bp).unwrap();
-    let mut qp4 = QueryParams::new(&cp, bp).unwrap();
-
-    let q1 = qp1.generate_query(0).unwrap();
-    let q2 = qp2.generate_query(1).unwrap();
-    let q3 = qp3.generate_query(2).unwrap();
-    let q4 = qp4.generate_query(3).unwrap();
-
-    let q1_slice = q1.as_slice();
-    let q2_slice = q2.as_slice();
-    let q3_slice = q3.as_slice();
-    let q4_slice = q4.as_slice();
-
-    let interleave_start = Instant::now();
-    let mut interleaved = vec![[0u32; 4]; m];
-    for i in 0..m {
-      interleaved[i] = [q1_slice[i], q2_slice[i], q3_slice[i], q4_slice[i]];
-    }
-    let bq4 = BatchedQuery4 { interleaved };
-    println!(
-      "Time to interleave memory: {:?}",
-      interleave_start.elapsed()
-    );
-
-    let iterations = 10;
-
-    let start_seq = Instant::now();
-    for _ in 0..iterations {
-      let _ = shard.respond(&q1).unwrap();
-      let _ = shard.respond(&q2).unwrap();
-      let _ = shard.respond(&q3).unwrap();
-      let _ = shard.respond(&q4).unwrap();
-    }
-    let duration_seq = start_seq.elapsed();
-
-    let start_batched = Instant::now();
-    for _ in 0..iterations {
-      let _ = shard.respond_batched_4(&bq4).unwrap();
-    }
-    let duration_batched = start_batched.elapsed();
-
-    println!("--------------------------------------------------");
-    println!(
-      "Performance Results ({} iterations of 4 queries):",
-      iterations
-    );
-    println!("Sequential (4 separate loops): {:?}", duration_seq);
-    println!("Interleaved Batched (1 loop):  {:?}", duration_batched);
-    println!(
-      "Speedup multiplier: {:.2}x",
-      duration_seq.as_secs_f64() / duration_batched.as_secs_f64()
-    );
-    println!("--------------------------------------------------");
-
-    assert!(duration_batched < duration_seq);
-  }
+  test_batch_size!(
+    test_batched_queries_2,
+    2,
+    BatchedQuery2,
+    BatchedResponse2,
+    respond_batched_2
+  );
+  test_batch_size!(
+    test_batched_queries_4,
+    4,
+    BatchedQuery4,
+    BatchedResponse4,
+    respond_batched_4
+  );
+  test_batch_size!(
+    test_batched_queries_8,
+    8,
+    BatchedQuery8,
+    BatchedResponse8,
+    respond_batched_8
+  );
+  test_batch_size!(
+    test_batched_queries_16,
+    16,
+    BatchedQuery16,
+    BatchedResponse16,
+    respond_batched_16
+  );
+  test_batch_size!(
+    test_batched_queries_32,
+    32,
+    BatchedQuery32,
+    BatchedResponse32,
+    respond_batched_32
+  );
 }

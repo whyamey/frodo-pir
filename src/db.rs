@@ -11,8 +11,9 @@ use crate::utils::matrices::*;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Database {
-  entries: Vec<Vec<u32>>,
+  entries: Vec<u32>,
   m: usize,
+  width: usize,
   elem_size: usize,
   plaintext_bits: usize,
 }
@@ -24,14 +25,13 @@ impl Database {
     elem_size: usize,
     plaintext_bits: usize,
   ) -> ResultBoxedError<Self> {
+    let rows = construct_rows(elements, m, elem_size, plaintext_bits)?;
+    let width = if rows.is_empty() { 0 } else { rows[0].len() };
+
     Ok(Self {
-      entries: swap_matrix_fmt(&construct_rows(
-        elements,
-        m,
-        elem_size,
-        plaintext_bits,
-      )?),
+      entries: flatten_matrix_col_major(&rows),
       m,
+      width,
       elem_size,
       plaintext_bits,
     })
@@ -48,89 +48,67 @@ impl Database {
     Self::new(&elements, m, elem_size, plaintext_bits)
   }
 
-  pub fn switch_fmt(&mut self) {
-    self.entries = swap_matrix_fmt(&self.entries);
-  }
-
   pub fn vec_mult(&self, row: &[u32], col_idx: usize) -> u32 {
-    vec_mult_u32_u32(row, &self.entries[col_idx]).unwrap()
+    let start = col_idx * self.m;
+    let col = &self.entries[start..start + self.m];
+    vec_mult_u32_u32(row, col).unwrap()
   }
 
-  /// Batched matrix multiplication optimized for LLVM auto-vectorization
-  pub fn vec_mult_batched(
+  /// Generic batched matrix multiplication for N interleaved queries.
+  /// Because N is a compile-time constant, LLVM will hopefully unroll
+  /// the inner loop and auto-vectorize it to AVX/NEON instructions.
+  pub fn vec_mult_batched_n<const N: usize>(
     &self,
-    q1: &[u32],
-    q2: &[u32],
+    q_interleaved: &[[u32; N]],
     col_idx: usize,
-  ) -> (u32, u32) {
-    let col = &self.entries[col_idx];
+  ) -> [u32; N] {
+    // Extract the contiguous column slice
+    let start = col_idx * self.m;
+    let col = &self.entries[start..start + self.m];
     let len = col.len();
 
     // By asserting equal lengths upfront, we prove to the compiler that
     // bounds checking inside the loop is unnecessary. LLVM will strip
     // the safety checks and unroll this into pure AVX/NEON instructions.
-    assert_eq!(q1.len(), len);
-    assert_eq!(q2.len(), len);
-
-    let mut acc1 = 0u32;
-    let mut acc2 = 0u32;
-
-    // A flat, indexed loop is the exact pattern the LLVM vectorizer looks for.
-    for i in 0..len {
-      let c = col[i];
-      acc1 = acc1.wrapping_add(q1[i].wrapping_mul(c));
-      acc2 = acc2.wrapping_add(q2[i].wrapping_mul(c));
-    }
-
-    (acc1, acc2)
-  }
-
-  /// Batched matrix multiplication for 4 interleaved queries.
-  /// The memory layout [u32; 4] forces 128-bit NEON alignment.
-  pub fn vec_mult_batched_4(
-    &self,
-    q_interleaved: &[[u32; 4]],
-    col_idx: usize,
-  ) -> [u32; 4] {
-    let col = &self.entries[col_idx];
-    let len = col.len();
-
-    // Zero bounds-checks inside the loop
     assert_eq!(q_interleaved.len(), len);
 
-    let mut acc = [0u32; 4];
+    let mut acc = [0u32; N];
 
     for i in 0..len {
       let c = col[i];
       let q = q_interleaved[i];
 
-      // The compiler translates this hopefully? directly to a vector multiply-add
-      acc[0] = acc[0].wrapping_add(q[0].wrapping_mul(c));
-      acc[1] = acc[1].wrapping_add(q[1].wrapping_mul(c));
-      acc[2] = acc[2].wrapping_add(q[2].wrapping_mul(c));
-      acc[3] = acc[3].wrapping_add(q[3].wrapping_mul(c));
+      // Hopefully LLVM auto translates this to vector multiply-add
+      for j in 0..N {
+        acc[j] = acc[j].wrapping_add(q[j].wrapping_mul(c));
+      }
     }
 
     acc
   }
 
   pub fn write_to_file(&self, path: &str) -> ResultBoxedError<()> {
-    let json = json!(self.entries);
+    let mut entries_2d = Vec::with_capacity(self.width);
+    for col in 0..self.width {
+      let start = col * self.m;
+      entries_2d.push(self.entries[start..start + self.m].to_vec());
+    }
+    let json = json!(entries_2d);
     Ok(serde_json::to_writer(&fs::File::create(path)?, &json)?)
   }
 
   /// Returns the ith row of the DB matrix
   pub fn get_row(&self, i: usize) -> Vec<u32> {
-    self.entries[i].clone()
+    let mut row = Vec::with_capacity(self.width);
+    for col in 0..self.width {
+      row.push(self.entries[col * self.m + i]);
+    }
+    row
   }
 
   /// Returns the ith DB entry as a base64-encoded string
   pub fn get_db_entry(&self, i: usize) -> String {
-    base64_from_u32_slice(
-      &get_matrix_second_at(&self.entries, i),
-      self.plaintext_bits,
-      self.elem_size,
-    )
+    base64_from_u32_slice(&self.get_row(i), self.plaintext_bits, self.elem_size)
   }
 
   /// Returns the width of the DB matrix
@@ -144,7 +122,7 @@ impl Database {
 
   /// Returns the width of the DB matrix
   pub fn get_matrix_width_self(&self) -> usize {
-    Database::get_matrix_width(self.get_elem_size(), self.get_plaintext_bits())
+    self.width
   }
 
   /// Get the matrix size
