@@ -3,7 +3,8 @@ use std::fmt::{Display, Formatter, Result as FmtResult};
 
 // ResultBoxedError returns a result of a given type or a boxed error, in order to encapsulate
 // generic error types without requiring an explicit implementation for each error type
-pub type ResultBoxedError<T> = Result<T, Box<dyn std::error::Error>>;
+pub type ResultBoxedError<T> =
+  Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 // ErrorUnexpectedInputSize is assocuated with unexpected input size on types used for the low
 // level cryptographic operations

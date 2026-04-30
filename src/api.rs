@@ -167,8 +167,9 @@ impl Response {
     let rounding_floor = get_rounding_floor(qp.plaintext_bits);
     let plaintext_size = get_plaintext_size(qp.plaintext_bits);
 
-    // perform division and rounding
+    // perform division and rounding in parallel
     (0..Database::get_matrix_width(qp.elem_size, qp.plaintext_bits))
+      .into_par_iter()
       .map(|i| {
         let unscaled_res = self.0[i].wrapping_sub(qp.rhs[i]);
         let scaled_res = unscaled_res / rounding_factor;
@@ -325,7 +326,7 @@ mod tests {
       fn $test_name() {
         use std::time::Instant;
 
-        let m = 2u32.pow(20) as usize;
+        let m = 2u32.pow(18) as usize;
         let elem_size = 2u32.pow(13) as usize;
         let plaintext_bits = 10usize;
         let lwe_dim = 1572;
@@ -356,12 +357,16 @@ mod tests {
           queries.push(qps[i].generate_query(idx).unwrap());
         }
 
-        let mut interleaved = vec![[0u32; $n]; m];
-        for row in 0..m {
-          for j in 0..$n {
-            interleaved[row][j] = queries[j].as_slice()[row];
-          }
-        }
+        let interleaved: Vec<[u32; $n]> = (0..m)
+          .into_par_iter()
+          .map(|row| {
+            let mut vals = [0u32; $n];
+            for j in 0..$n {
+              vals[j] = queries[j].as_slice()[row];
+            }
+            vals
+          })
+          .collect();
 
         let bq = super::$query_type { interleaved };
 

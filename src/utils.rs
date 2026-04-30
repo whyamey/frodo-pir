@@ -27,6 +27,8 @@ pub mod lwe {
 pub mod matrices {
   use rand::rngs::StdRng;
   use rand_core::{OsRng, RngCore, SeedableRng};
+  use rayon::prelude::*;
+  use sha2::{Digest, Sha256};
 
   use crate::errors::ErrorUnexpectedInputSize;
   use crate::errors::ResultBoxedError;
@@ -34,33 +36,44 @@ pub mod matrices {
   /// Takes a matrix in row (column) format, and returns it in column (row) format
   pub fn swap_matrix_fmt(matrix: &[Vec<u32>]) -> Vec<Vec<u32>> {
     let height = matrix.len();
-    let width = matrix[0].len(); // assumes all entries are the same size
-    let mut swapped_row = vec![Vec::with_capacity(height); width];
-    for current_row in matrix {
-      for i in 0..width {
-        swapped_row[i].push(current_row[i]);
-      }
-    }
-    swapped_row
+    let width = matrix[0].len();
+
+    (0..width)
+      .into_par_iter()
+      .map(|col_idx| {
+        let mut new_row = Vec::with_capacity(height);
+        for row_idx in 0..height {
+          new_row.push(matrix[row_idx][col_idx]);
+        }
+        new_row
+      })
+      .collect()
   }
 
-  /// Generates an LWE matrix from a public seed
-  /// This corresponds to the generation of `A` in the paper.
+  /// Parallel geenerates an LWE matrix from a public seed with deterministic seeding.
+  /// This corresponds to the generation of `A` in the paper. Client and server gets same 'A'.
   pub fn generate_lwe_matrix_from_seed(
     seed: [u8; 32],
     lwe_dim: usize,
     width: usize,
   ) -> Vec<Vec<u32>> {
-    let mut a = Vec::with_capacity(width);
-    let mut rng = get_seeded_rng(seed);
-    for _ in 0..width {
-      let mut v = Vec::with_capacity(lwe_dim);
-      for _ in 0..lwe_dim {
-        v.push(rng.next_u32());
-      }
-      a.push(v);
-    }
-    a
+    (0..width)
+      .into_par_iter()
+      .map(|i| {
+        // Derive a unique seed for this specific column: H(master_seed || column_index)
+        let mut hasher = Sha256::new();
+        hasher.update(seed);
+        hasher.update((i as u64).to_le_bytes());
+        let sub_seed: [u8; 32] = hasher.finalize().into();
+
+        let mut rng = StdRng::from_seed(sub_seed);
+        let mut v = Vec::with_capacity(lwe_dim);
+        for _ in 0..lwe_dim {
+          v.push(rng.next_u32());
+        }
+        v
+      })
+      .collect()
   }
 
   /// Multiplies a u32 vector with a u32 column vector
@@ -79,11 +92,6 @@ pub mod matrices {
       acc = acc.wrapping_add(row[i].wrapping_mul(col[i]));
     }
     Ok(acc)
-  }
-
-  /// Returns a seeded RNG for sampling values
-  fn get_seeded_rng(s: [u8; 32]) -> StdRng {
-    StdRng::from_seed(s)
   }
 
   // Values used to denote the size of intervals that are used for
@@ -130,18 +138,16 @@ pub mod matrices {
 
   /// Takes a matrix in row format, and returns it flattened in column-major format
   pub fn flatten_matrix_col_major(matrix: &[Vec<u32>]) -> Vec<u32> {
-    if matrix.is_empty() { return Vec::new(); }
+    if matrix.is_empty() {
+      return Vec::new();
+    }
     let height = matrix.len();
     let width = matrix[0].len();
-    
-    let mut flat = Vec::with_capacity(height * width);
-    
-    for col in 0..width {
-      for row in 0..height {
-        flat.push(matrix[row][col]);
-      }
-    }
-    flat
+
+    (0..width)
+      .into_par_iter()
+      .flat_map_iter(|col| (0..height).map(move |row| matrix[row][col]))
+      .collect()
   }
 }
 

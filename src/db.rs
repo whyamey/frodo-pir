@@ -2,6 +2,7 @@ use std::fs;
 use std::io::BufReader;
 
 use rand_core::{OsRng, RngCore};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -185,6 +186,7 @@ impl BaseParams {
     let lhs =
       swap_matrix_fmt(&generate_lwe_matrix_from_seed(public_seed, dim, m));
     (0..db.get_matrix_width_self())
+      .into_par_iter()
       .map(|i| {
         let mut col = Vec::with_capacity(m);
         for r in &lhs {
@@ -270,21 +272,23 @@ fn construct_rows(
 ) -> ResultBoxedError<Vec<Vec<u32>>> {
   let row_width = Database::get_matrix_width(elem_size, plaintext_bits);
 
-  let result = (0..m).map(|i| -> ResultBoxedError<Vec<u32>> {
-    let mut row = Vec::with_capacity(row_width);
-    let data = &elements[i];
-    let bytes = base64::decode(data)?;
-    let bits = bytes_to_bits_le(&bytes);
-    for i in 0..row_width {
-      let end_bound = (i + 1) * plaintext_bits;
-      if end_bound < bits.len() {
-        row.push(bits_to_u32_le(&bits[i * plaintext_bits..end_bound])?);
-      } else {
-        row.push(bits_to_u32_le(&bits[i * plaintext_bits..])?);
+  let result = (0..m)
+    .into_par_iter()
+    .map(|i| -> ResultBoxedError<Vec<u32>> {
+      let mut row = Vec::with_capacity(row_width);
+      let data = &elements[i];
+      let bytes = base64::decode(data)?;
+      let bits = bytes_to_bits_le(&bytes);
+      for i in 0..row_width {
+        let end_bound = (i + 1) * plaintext_bits;
+        if end_bound < bits.len() {
+          row.push(bits_to_u32_le(&bits[i * plaintext_bits..end_bound])?);
+        } else {
+          row.push(bits_to_u32_le(&bits[i * plaintext_bits..])?);
+        }
       }
-    }
-    Ok(row)
-  });
+      Ok(row)
+    });
 
   result.collect()
 }
