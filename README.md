@@ -1,3 +1,11 @@
+# Fork of FrodoPIR
+This is a fork of FrodoPIR to use as a backend for our paper with minor cache and autovec friendly optimizations. Please use the [original repository](https://github.com/brave-experiments/frodo-pir) if you are looking for the official FrodoPIR implementation.
+
+## ⚠️ Important Warning
+This implementation is intended to be used to churn numbers for our paper. Do not use this under any other circumstances. The code has NOT been vetted by security experts. Therefore, no part of this code should be used in any real-world or production setting.
+
+We've left the original readme as it is and can be found below this text.
+
 # FrodoPIR
 
 ![FrodoPIR workflow](https://github.com/brave-experiments/frodo-pir/actions/workflows/rust.yml/badge.svg)
