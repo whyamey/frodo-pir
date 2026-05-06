@@ -154,7 +154,7 @@ impl Query {
 
 /// The `Response` object wraps a response from a single shard
 #[derive(Clone, Serialize, Deserialize)]
-pub struct Response(Vec<u32>);
+pub struct Response(pub Vec<u32>);
 impl Response {
   pub fn as_slice(&self) -> &[u32] {
     &self.0
