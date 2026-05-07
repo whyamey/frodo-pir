@@ -153,7 +153,7 @@ pub struct BaseParams {
   plaintext_bits: usize,
 
   public_seed: [u8; 32],
-  rhs: Vec<Vec<u32>>,
+  rhs: Vec<u32>,
 }
 
 impl BaseParams {
@@ -182,13 +182,14 @@ impl BaseParams {
     public_seed: [u8; 32],
     dim: usize,
     m: usize,
-  ) -> Vec<Vec<u32>> {
+  ) -> Vec<u32> {
     let lhs =
       swap_matrix_fmt(&generate_lwe_matrix_from_seed(public_seed, dim, m));
+
     (0..db.get_matrix_width_self())
       .into_par_iter()
-      .map(|i| {
-        let mut col = Vec::with_capacity(m);
+      .flat_map_iter(|i| {
+        let mut col = Vec::with_capacity(dim);
         for r in &lhs {
           col.push(db.vec_mult(r, i));
         }
@@ -208,10 +209,42 @@ impl BaseParams {
 
   /// Computes c = s*(A*DB) using the RHS of the public parameters
   pub fn mult_right(&self, s: &[u32]) -> ResultBoxedError<Vec<u32>> {
-    let cols = &self.rhs;
-    (0..cols.len())
-      .map(|i| vec_mult_u32_u32(s, &cols[i]))
-      .collect()
+    let width = self.rhs.len() / self.dim;
+    let res: Vec<u32> = (0..width)
+      .into_par_iter()
+      .map(|i| {
+        let start = i * self.dim;
+        let col = &self.rhs[start..start + self.dim];
+        vec_mult_u32_u32(s, col).unwrap()
+      })
+      .collect();
+    Ok(res)
+  }
+
+  pub fn mult_right_batched_n<const N: usize>(
+    &self,
+    s_interleaved: &[[u32; N]],
+  ) -> ResultBoxedError<Vec<[u32; N]>> {
+    let width = self.rhs.len() / self.dim;
+    let res: Vec<[u32; N]> = (0..width)
+      .into_par_iter()
+      .map(|col_idx| {
+        let start = col_idx * self.dim;
+        let col = &self.rhs[start..start + self.dim];
+        assert_eq!(s_interleaved.len(), self.dim);
+
+        let mut acc = [0u32; N];
+        for i in 0..self.dim {
+          let c = col[i];
+          let s = s_interleaved[i];
+          for j in 0..N {
+            acc[j] = acc[j].wrapping_add(s[j].wrapping_mul(c));
+          }
+        }
+        acc
+      })
+      .collect();
+    Ok(res)
   }
 
   pub fn get_total_records(&self) -> usize {
@@ -234,33 +267,73 @@ impl BaseParams {
 /// `CommonParams` holds the derived uniform matrix that is used for
 /// constructing the server's public parameters and the client query.
 #[derive(Serialize, Deserialize)]
-pub struct CommonParams(Vec<Vec<u32>>);
+pub struct CommonParams {
+  matrix: Vec<u32>,
+  m: usize,
+  dim: usize,
+}
+
 impl CommonParams {
   // Returns the internal matrix
-  pub fn as_matrix(&self) -> &[Vec<u32>] {
-    &self.0
+  pub fn as_matrix_flat(&self) -> &[u32] {
+    &self.matrix
   }
 
   /// Computes b = s*A + e using the seed used to generate the matrix of
   /// the public parameters
   pub fn mult_left(&self, s: &[u32]) -> ResultBoxedError<Vec<u32>> {
-    let cols = self.as_matrix();
-    (0..cols.len())
+    let res: Vec<u32> = (0..self.m)
+      .into_par_iter()
       .map(|i| {
-        let s_a = vec_mult_u32_u32(s, &cols[i])?;
+        let start = i * self.dim;
+        let col = &self.matrix[start..start + self.dim];
+        let s_a = vec_mult_u32_u32(s, col).unwrap();
         let e = random_ternary();
-        Ok(s_a.wrapping_add(e))
+        s_a.wrapping_add(e)
       })
-      .collect()
+      .collect();
+    Ok(res)
+  }
+
+  pub fn mult_left_batched_n<const N: usize>(
+    &self,
+    s_interleaved: &[[u32; N]],
+  ) -> ResultBoxedError<Vec<[u32; N]>> {
+    let res: Vec<[u32; N]> = (0..self.m)
+      .into_par_iter()
+      .map(|col_idx| {
+        let start = col_idx * self.dim;
+        let col = &self.matrix[start..start + self.dim];
+        assert_eq!(s_interleaved.len(), self.dim);
+
+        let mut acc = [0u32; N];
+        for i in 0..self.dim {
+          let c = col[i];
+          let s = s_interleaved[i];
+          for j in 0..N {
+            acc[j] = acc[j].wrapping_add(s[j].wrapping_mul(c));
+          }
+        }
+        // Add random ternary error for each batched element
+        for j in 0..N {
+          acc[j] = acc[j].wrapping_add(random_ternary());
+        }
+        acc
+      })
+      .collect();
+    Ok(res)
   }
 }
+
 impl From<&BaseParams> for CommonParams {
   fn from(params: &BaseParams) -> Self {
-    Self(generate_lwe_matrix_from_seed(
-      params.public_seed,
-      params.dim,
-      params.m,
-    ))
+    let cols =
+      generate_lwe_matrix_from_seed(params.public_seed, params.dim, params.m);
+    Self {
+      matrix: cols.into_iter().flatten().collect(),
+      m: params.m,
+      dim: params.dim,
+    }
   }
 }
 

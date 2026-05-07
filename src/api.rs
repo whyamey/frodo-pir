@@ -233,11 +233,79 @@ macro_rules! impl_batched_api {
   };
 }
 
+macro_rules! impl_batched_query_params {
+  ($n:expr, $name:ident) => {
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct $name {
+      pub lhs: Vec<[u32; $n]>,
+      pub rhs: Vec<[u32; $n]>,
+      pub elem_size: usize,
+      pub plaintext_bits: usize,
+      pub used: [bool; $n],
+    }
+
+    impl $name {
+      pub fn new(cp: &CommonParams, bp: &BaseParams) -> ResultBoxedError<Self> {
+        let dim = bp.get_dim();
+
+        let mut s_interleaved = vec![[0u32; $n]; dim];
+        for j in 0..$n {
+          let s = random_ternary_vector(dim);
+          for i in 0..dim {
+            s_interleaved[i][j] = s[i];
+          }
+        }
+
+        let lhs = cp.mult_left_batched_n::<$n>(&s_interleaved)?;
+        let rhs = bp.mult_right_batched_n::<$n>(&s_interleaved)?;
+
+        Ok(Self {
+          lhs,
+          rhs,
+          elem_size: bp.get_elem_size(),
+          plaintext_bits: bp.get_plaintext_bits(),
+          used: [false; $n],
+        })
+      }
+
+      pub fn extract_query_params(
+        &mut self,
+        index: usize,
+      ) -> ResultBoxedError<QueryParams> {
+        if self.used[index] {
+          return Err(Box::new(ErrorQueryParamsReused {}));
+        }
+        self.used[index] = true;
+
+        // De-interleave the requested query constraints
+        let extracted_lhs: Vec<u32> =
+          self.lhs.iter().map(|row| row[index]).collect();
+        let extracted_rhs: Vec<u32> =
+          self.rhs.iter().map(|row| row[index]).collect();
+
+        Ok(QueryParams {
+          lhs: extracted_lhs,
+          rhs: extracted_rhs,
+          elem_size: self.elem_size,
+          plaintext_bits: self.plaintext_bits,
+          used: false,
+        })
+      }
+    }
+  };
+}
+
 impl_batched_api!(2, BatchedQuery2, BatchedResponse2, respond_batched_2);
 impl_batched_api!(4, BatchedQuery4, BatchedResponse4, respond_batched_4);
 impl_batched_api!(8, BatchedQuery8, BatchedResponse8, respond_batched_8);
 impl_batched_api!(16, BatchedQuery16, BatchedResponse16, respond_batched_16);
 impl_batched_api!(32, BatchedQuery32, BatchedResponse32, respond_batched_32);
+
+impl_batched_query_params!(2, BatchedQueryParams2);
+impl_batched_query_params!(4, BatchedQueryParams4);
+impl_batched_query_params!(8, BatchedQueryParams8);
+impl_batched_query_params!(16, BatchedQueryParams16);
+impl_batched_query_params!(32, BatchedQueryParams32);
 
 #[cfg(test)]
 mod tests {
@@ -418,6 +486,84 @@ mod tests {
     };
   }
 
+  macro_rules! test_client_batch_size {
+    ($test_name:ident, $n:expr, $batch_type:ident) => {
+      #[test]
+      fn $test_name() {
+        use std::time::Instant;
+
+        let m = 2u32.pow(18) as usize;
+        let elem_size = 2u32.pow(13) as usize;
+        let plaintext_bits = 10usize;
+        let lwe_dim = 1572;
+
+        let db_elems = generate_db_elems(m, (elem_size + 7) / 8);
+        let shard = Shard::from_base64_strings(
+          &db_elems,
+          lwe_dim,
+          m,
+          elem_size,
+          plaintext_bits,
+        )
+        .unwrap();
+
+        let bp = shard.get_base_params();
+        let cp = CommonParams::from(bp);
+
+        let iterations = 10;
+
+        // Warmup
+        let _ = QueryParams::new(&cp, bp).unwrap();
+        let _ = super::$batch_type::new(&cp, bp).unwrap();
+
+        let start_seq = Instant::now();
+        for _ in 0..iterations {
+          for _ in 0..$n {
+            let _ = QueryParams::new(&cp, bp).unwrap();
+          }
+        }
+        let duration_seq = start_seq.elapsed();
+
+        let start_batched = Instant::now();
+        for _ in 0..iterations {
+          let _ = super::$batch_type::new(&cp, bp).unwrap();
+        }
+        let duration_batched = start_batched.elapsed();
+
+        println!("\n--------------------------------------------------");
+        println!(
+          "Client Preprocessing Performance for Batch Size {} ({} iterations):",
+          $n, iterations
+        );
+        println!("Sequential ({} separate creations): {:?}", $n, duration_seq);
+        println!("SIMD Batched (1 batched creation):  {:?}", duration_batched);
+        println!(
+          "Speedup multiplier: {:.2}x",
+          duration_seq.as_secs_f64() / duration_batched.as_secs_f64()
+        );
+        println!("--------------------------------------------------");
+
+        // Ensure that the extracted queries still retrieve the correct items
+        let mut batched_qps = super::$batch_type::new(&cp, bp).unwrap();
+        for j in 0..$n {
+          let mut qp = batched_qps.extract_query_params(j).unwrap();
+          let target_row = j; // Targeted the j-th row for simplicity
+
+          let q = qp.generate_query(target_row).unwrap();
+          let d_resp = shard.respond(&q).unwrap();
+          let resp: super::Response = bincode::deserialize(&d_resp).unwrap();
+
+          let output = resp.parse_output_as_base64(&qp);
+          assert_eq!(
+            output, db_elems[target_row],
+            "Batched query {} failed!",
+            j
+          );
+        }
+      }
+    };
+  }
+
   test_batch_size!(
     test_batched_queries_2,
     2,
@@ -453,4 +599,10 @@ mod tests {
     BatchedResponse32,
     respond_batched_32
   );
+
+  test_client_batch_size!(test_client_batch_2, 2, BatchedQueryParams2);
+  test_client_batch_size!(test_client_batch_4, 4, BatchedQueryParams4);
+  test_client_batch_size!(test_client_batch_8, 8, BatchedQueryParams8);
+  test_client_batch_size!(test_client_batch_16, 16, BatchedQueryParams16);
+  test_client_batch_size!(test_client_batch_32, 32, BatchedQueryParams32);
 }
