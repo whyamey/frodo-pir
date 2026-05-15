@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::BufReader;
+use std::simd::Simd;
 
 use rand_core::{OsRng, RngCore};
 use rayon::prelude::*;
@@ -30,7 +31,7 @@ impl Database {
     let width = if rows.is_empty() { 0 } else { rows[0].len() };
 
     Ok(Self {
-      entries: flatten_matrix_col_major(&rows),
+      entries: crate::utils::matrices::flatten_matrix_row_major(&rows),
       m,
       width,
       elem_size,
@@ -50,61 +51,71 @@ impl Database {
   }
 
   pub fn vec_mult(&self, row: &[u32], col_idx: usize) -> u32 {
-    let start = col_idx * self.m;
-    let col = &self.entries[start..start + self.m];
-    vec_mult_u32_u32(row, col).unwrap()
+    let mut acc = 0u32;
+    for i in 0..self.m {
+      acc = acc.wrapping_add(
+        row[i].wrapping_mul(self.entries[i * self.width + col_idx]),
+      );
+    }
+    acc
   }
 
   /// Generic batched matrix multiplication for N interleaved queries.
   /// Because N is a compile-time constant, LLVM will hopefully unroll
   /// the inner loop and auto-vectorize it to AVX/NEON instructions.
-  pub fn vec_mult_batched_n<const N: usize>(
-    &self,
-    q_interleaved: &[[u32; N]],
-    col_idx: usize,
-  ) -> [u32; N] {
-    // Extract the contiguous column slice
-    let start = col_idx * self.m;
-    let col = &self.entries[start..start + self.m];
-    let len = col.len();
-
-    // By asserting equal lengths upfront, we prove to the compiler that
-    // bounds checking inside the loop is unnecessary. LLVM will strip
-    // the safety checks and unroll this into pure AVX/NEON instructions.
-    assert_eq!(q_interleaved.len(), len);
-
-    let mut acc = [0u32; N];
-
-    for i in 0..len {
-      let c = col[i];
-      let q = q_interleaved[i];
-
-      // Hopefully LLVM auto translates this to vector multiply-add
-      for j in 0..N {
-        acc[j] = acc[j].wrapping_add(q[j].wrapping_mul(c));
-      }
-    }
-
-    acc
-  }
+  /// Now with explicit std::simd and as a macro.
 
   pub fn write_to_file(&self, path: &str) -> ResultBoxedError<()> {
     let mut entries_2d = Vec::with_capacity(self.width);
     for col in 0..self.width {
-      let start = col * self.m;
-      entries_2d.push(self.entries[start..start + self.m].to_vec());
+      let mut column = Vec::with_capacity(self.m);
+      for row in 0..self.m {
+        column.push(self.entries[row * self.width + col]);
+      }
+      entries_2d.push(column);
     }
-    let json = json!(entries_2d);
-    Ok(serde_json::to_writer(&fs::File::create(path)?, &json)?)
+    let json = serde_json::json!(entries_2d);
+    Ok(serde_json::to_writer(&std::fs::File::create(path)?, &json)?)
+  }
+
+  /// Row-Major single query evaluator
+  pub fn eval_single(&self, q: &[u32]) -> Vec<u32> {
+    assert_eq!(q.len(), self.m);
+
+    let row_chunk_size = 1024;
+    (0..self.m)
+      .into_par_iter()
+      .chunks(row_chunk_size)
+      .fold(
+        || vec![0u32; self.width],
+        |mut local_acc, row_indices| {
+          for row in row_indices {
+            let q_val = q[row];
+            let row_offset = row * self.width;
+            let db_row = &self.entries[row_offset .. row_offset + self.width];
+
+            for col in 0..self.width {
+              local_acc[col] = local_acc[col].wrapping_add(q_val.wrapping_mul(db_row[col]));
+            }
+          }
+          local_acc
+        }
+      )
+      .reduce(
+        || vec![0u32; self.width],
+        |mut acc_a, acc_b| {
+          for col in 0..self.width {
+            acc_a[col] = acc_a[col].wrapping_add(acc_b[col]);
+          }
+          acc_a
+        }
+      )
   }
 
   /// Returns the ith row of the DB matrix
   pub fn get_row(&self, i: usize) -> Vec<u32> {
-    let mut row = Vec::with_capacity(self.width);
-    for col in 0..self.width {
-      row.push(self.entries[col * self.m + i]);
-    }
-    row
+    let start = i * self.width;
+    self.entries[start..start + self.width].to_vec()
   }
 
   /// Returns the ith DB entry as a base64-encoded string
@@ -183,19 +194,98 @@ impl BaseParams {
     dim: usize,
     m: usize,
   ) -> Vec<u32> {
-    let lhs =
-      swap_matrix_fmt(&generate_lwe_matrix_from_seed(public_seed, dim, m));
+    let lhs = swap_matrix_fmt(&generate_lwe_matrix_from_seed(public_seed, dim, m));
+    let width = db.get_matrix_width_self();
 
-    (0..db.get_matrix_width_self())
-      .into_par_iter()
-      .flat_map_iter(|i| {
-        let mut col = Vec::with_capacity(dim);
-        for r in &lhs {
-          col.push(db.vec_mult(r, i));
+    let mut c_rows: Vec<Vec<u32>> = Vec::with_capacity(dim);
+    let mut row_idx = 0;
+
+    // Bulk Processing with 64 as its fastest
+    while row_idx + 64 <= dim {
+      let mut interleaved = vec![[0u32; 64]; m];
+      for i in 0..m {
+        for j in 0..64 {
+          interleaved[i][j] = lhs[row_idx + j][i];
         }
-        col
-      })
-      .collect()
+      }
+      let batched_res = db.eval_batched_64(&interleaved);
+      for j in 0..64 {
+        let mut row = Vec::with_capacity(width);
+        for col in 0..width { row.push(batched_res[col][j]); }
+        c_rows.push(row);
+      }
+      row_idx += 64;
+    }
+
+    // Cascade down to 32
+    if row_idx + 32 <= dim {
+      let mut interleaved = vec![[0u32; 32]; m];
+      for i in 0..m {
+        for j in 0..32 { interleaved[i][j] = lhs[row_idx + j][i]; }
+      }
+      let batched_res = db.eval_batched_32(&interleaved);
+      for j in 0..32 {
+        let mut row = Vec::with_capacity(width);
+        for col in 0..width { row.push(batched_res[col][j]); }
+        c_rows.push(row);
+      }
+      row_idx += 32;
+    }
+
+    // Cascade down to 16
+    if row_idx + 16 <= dim {
+      let mut interleaved = vec![[0u32; 16]; m];
+      for i in 0..m {
+        for j in 0..16 { interleaved[i][j] = lhs[row_idx + j][i]; }
+      }
+      let batched_res = db.eval_batched_16(&interleaved);
+      for j in 0..16 {
+        let mut row = Vec::with_capacity(width);
+        for col in 0..width { row.push(batched_res[col][j]); }
+        c_rows.push(row);
+      }
+      row_idx += 16;
+    }
+
+    // Pad remaining into an 16 or 8 evaluator
+    if row_idx < dim {
+      let leftover = dim - row_idx;
+      
+      // If we have 8 or fewer leftovers, use the cheapest 8 block.
+      if leftover <= 8 {
+          let mut interleaved = vec![[0u32; 8]; m];
+          for i in 0..m {
+            for j in 0..leftover { interleaved[i][j] = lhs[row_idx + j][i]; }
+          }
+          let batched_res = db.eval_batched_8(&interleaved);
+          for j in 0..leftover { // Only extract the valid leftovers!
+            let mut row = Vec::with_capacity(width);
+            for col in 0..width { row.push(batched_res[col][j]); }
+            c_rows.push(row);
+          }
+      } else {
+          // If we have 9-15 leftovers, pad them into a 16x block.
+          let mut interleaved = vec![[0u32; 16]; m];
+          for i in 0..m {
+            for j in 0..leftover { interleaved[i][j] = lhs[row_idx + j][i]; }
+          }
+          let batched_res = db.eval_batched_16(&interleaved);
+          for j in 0..leftover {
+            let mut row = Vec::with_capacity(width);
+            for col in 0..width { row.push(batched_res[col][j]); }
+            c_rows.push(row);
+          }
+      }
+    }
+
+    let mut flat_col_major = Vec::with_capacity(width * dim);
+    for col in 0..width {
+      for row in 0..dim {
+        flat_col_major.push(c_rows[row][col]);
+      }
+    }
+
+    flat_col_major
   }
 
   /// Writes the params struct as JSON to file
@@ -365,6 +455,125 @@ fn construct_rows(
 
   result.collect()
 }
+
+
+
+/// Generic batched matrix multiplication for N interleaved queries.
+/// Because N is a compile-time constant, LLVM will hopefully unroll
+/// the inner loop and auto-vectorize it to AVX/NEON instructions.
+/// Now with explicit std::simd and as a macro.
+macro_rules! impl_db_eval_batched {
+  ($n:expr, $method_name:ident) => {
+    impl Database {
+      pub fn $method_name(
+        &self,
+        q_interleaved: &[[u32; $n]],
+      ) -> Vec<[u32; $n]> {
+        assert_eq!(q_interleaved.len(), self.m);
+
+        let row_chunk_size = 1024; 
+
+        (0..self.m)
+          .into_par_iter()
+          .chunks(row_chunk_size)
+          .fold(
+            || vec![Simd::<u32, $n>::splat(0); self.width], 
+            |mut local_acc, row_indices| {
+              
+              for row in row_indices {
+                let q_vec = Simd::<u32, $n>::from_array(q_interleaved[row]);
+                let row_offset = row * self.width;
+                let db_row = &self.entries[row_offset .. row_offset + self.width];
+
+                for col in 0..self.width {
+                  let db_val = Simd::<u32, $n>::splat(db_row[col]);
+                  local_acc[col] += q_vec * db_val; 
+                }
+              }
+              local_acc
+            },
+          )
+          .reduce(
+            || vec![Simd::<u32, $n>::splat(0); self.width],
+            |mut acc_a, acc_b| {
+              for col in 0..self.width {
+                acc_a[col] += acc_b[col];
+              }
+              acc_a
+            },
+          )
+          .into_iter()
+          .map(|simd_val| simd_val.to_array())
+          .collect()
+      }
+    }
+  };
+}
+
+/// Macro for N > 64. Relies on LLVM auto-vectorization to unroll N into 
+/// multiple AVX-512 registers, since std::simd maxes out at 64 lanes.
+macro_rules! impl_db_eval_batched_large {
+  ($n:expr, $method_name:ident) => {
+    impl Database {
+      pub fn $method_name(
+        &self,
+        q_interleaved: &[[u32; $n]],
+      ) -> Vec<[u32; $n]> {
+        assert_eq!(q_interleaved.len(), self.m);
+
+        // Keep cache tiling active
+        let row_chunk_size = 1024; 
+
+        (0..self.m)
+          .into_par_iter()
+          .chunks(row_chunk_size)
+          .fold(
+            || vec![[0u32; $n]; self.width], 
+            |mut local_acc, row_indices| {
+              
+              for row in row_indices {
+                let q_vec = &q_interleaved[row];
+                let row_offset = row * self.width;
+                let db_row = &self.entries[row_offset .. row_offset + self.width];
+
+                for col in 0..self.width {
+                  let db_val = db_row[col];
+                  // LLVM will hopefully unroll this inner loop into AVX-512 instructions
+                  for j in 0..$n {
+                    local_acc[col][j] = local_acc[col][j].wrapping_add(q_vec[j].wrapping_mul(db_val));
+                  }
+                }
+              }
+              local_acc
+            },
+          )
+          .reduce(
+            || vec![[0u32; $n]; self.width],
+            |mut acc_a, acc_b| {
+              for col in 0..self.width {
+                for j in 0..$n {
+                  acc_a[col][j] = acc_a[col][j].wrapping_add(acc_b[col][j]);
+                }
+              }
+              acc_a
+            },
+          )
+      }
+    }
+  };
+}
+
+impl_db_eval_batched!(2, eval_batched_2);
+impl_db_eval_batched!(4, eval_batched_4);
+impl_db_eval_batched!(8, eval_batched_8);
+impl_db_eval_batched!(16, eval_batched_16);
+impl_db_eval_batched!(32, eval_batched_32);
+impl_db_eval_batched!(64, eval_batched_64);
+
+impl_db_eval_batched_large!(128, eval_batched_128);
+impl_db_eval_batched_large!(256, eval_batched_256);
+impl_db_eval_batched_large!(512, eval_batched_512);
+impl_db_eval_batched_large!(1024, eval_batched_1024);
 
 fn generate_seed() -> [u8; 32] {
   let mut seed = [0u8; 32];

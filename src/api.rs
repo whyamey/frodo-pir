@@ -13,6 +13,89 @@ use std::str;
 
 use rayon::prelude::*;
 
+pub mod array_serde {
+    use serde::{ser::{SerializeSeq, SerializeTuple}, de::{SeqAccess, Visitor}, Deserializer, Serializer, Deserialize};
+    use std::fmt;
+
+    pub fn serialize<S, const N: usize>(arrays: &Vec<[u32; N]>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(arrays.len()))?;
+        for array in arrays {
+            struct ArrayTuple<'a, const N: usize>(&'a [u32; N]);
+            impl<'a, const N: usize> serde::Serialize for ArrayTuple<'a, N> {
+                fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                where S: Serializer {
+                    let mut tup = serializer.serialize_tuple(N)?;
+                    for item in self.0 {
+                        tup.serialize_element(item)?;
+                    }
+                    tup.end()
+                }
+            }
+            seq.serialize_element(&ArrayTuple(array))?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D, const N: usize>(deserializer: D) -> Result<Vec<[u32; N]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct VecVisitor<const N: usize>;
+
+        impl<'de, const N: usize> Visitor<'de> for VecVisitor<N> {
+            type Value = Vec<[u32; N]>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a sequence of arrays")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut vec = match seq.size_hint() {
+                    Some(size) => Vec::with_capacity(size),
+                    None => Vec::new(),
+                };
+
+                struct ArrayTuple<const N: usize>([u32; N]);
+                impl<'de, const N: usize> Deserialize<'de> for ArrayTuple<N> {
+                    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+                    where D: Deserializer<'de> {
+                        struct ArrayVisitor<const N: usize>;
+                        impl<'de, const N: usize> Visitor<'de> for ArrayVisitor<N> {
+                            type Value = [u32; N];
+                            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                                formatter.write_str("an array of length N")
+                            }
+                            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+                            where A: SeqAccess<'de> {
+                                let mut arr = [0u32; N];
+                                for i in 0..N {
+                                    arr[i] = seq.next_element()?
+                                        .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
+                                }
+                                Ok(arr)
+                            }
+                        }
+                        deserializer.deserialize_tuple(N, ArrayVisitor::<N>).map(ArrayTuple)
+                    }
+                }
+
+                while let Some(tup) = seq.next_element::<ArrayTuple<N>>()? {
+                    vec.push(tup.0);
+                }
+                Ok(vec)
+            }
+        }
+
+        deserializer.deserialize_seq(VecVisitor::<N>)
+    }
+}
+
 /// A `Shard` is an instance of a database, where each row corresponds
 /// to a single element, that has been preprocessed by the server.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -68,16 +151,12 @@ impl Shard {
   // client query: c' = b' * DB
   pub fn respond(&self, q: &Query) -> ResultBoxedError<Vec<u8>> {
     let q = q.as_slice();
-    let resp = Response(
-      (0..self.db.get_matrix_width_self())
-        .map(|i| self.db.vec_mult(q, i))
-        .collect(),
-    );
+    let resp = Response(self.db.eval_single(q));
     let ser = bincode::serialize(&resp);
 
     Ok(ser?)
   }
-
+ 
   /// Returns the database
   pub fn get_db(&self) -> &Database {
     &self.db
@@ -201,14 +280,16 @@ impl Response {
 /// The `BatchedResponse` object wraps the responses for client queries.
 /// Produces a serialized response to interleaved queries simultaneously.
 macro_rules! impl_batched_api {
-  ($n:expr, $query_name:ident, $resp_name:ident, $method_name:ident) => {
+  ($n:expr, $query_name:ident, $resp_name:ident, $method_name:ident, $db_eval_method:ident) => {
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub struct $query_name {
+      #[serde(with = "crate::api::array_serde")]
       pub interleaved: Vec<[u32; $n]>,
     }
 
     #[derive(Clone, Serialize, Deserialize)]
     pub struct $resp_name {
+      #[serde(with = "crate::api::array_serde")]
       pub results: Vec<[u32; $n]>,
     }
 
@@ -217,13 +298,8 @@ macro_rules! impl_batched_api {
         &self,
         bq: &$query_name,
       ) -> ResultBoxedError<Vec<u8>> {
-        let width = self.db.get_matrix_width_self();
-
-        // Par iterator hopefully splits the columns
-        let results: Vec<[u32; $n]> = (0..width)
-          .into_par_iter()
-          .map(|i| self.db.vec_mult_batched_n::<$n>(&bq.interleaved, i))
-          .collect();
+        
+        let results = self.db.$db_eval_method(&bq.interleaved);
 
         let resp = $resp_name { results };
         let ser = bincode::serialize(&resp);
@@ -235,7 +311,6 @@ macro_rules! impl_batched_api {
 
 macro_rules! impl_batched_query_params {
   ($n:expr, $name:ident) => {
-    #[derive(Clone, Debug, Serialize, Deserialize)]
     pub struct $name {
       pub lhs: Vec<[u32; $n]>,
       pub rhs: Vec<[u32; $n]>,
@@ -295,17 +370,27 @@ macro_rules! impl_batched_query_params {
   };
 }
 
-impl_batched_api!(2, BatchedQuery2, BatchedResponse2, respond_batched_2);
-impl_batched_api!(4, BatchedQuery4, BatchedResponse4, respond_batched_4);
-impl_batched_api!(8, BatchedQuery8, BatchedResponse8, respond_batched_8);
-impl_batched_api!(16, BatchedQuery16, BatchedResponse16, respond_batched_16);
-impl_batched_api!(32, BatchedQuery32, BatchedResponse32, respond_batched_32);
-
 impl_batched_query_params!(2, BatchedQueryParams2);
 impl_batched_query_params!(4, BatchedQueryParams4);
 impl_batched_query_params!(8, BatchedQueryParams8);
 impl_batched_query_params!(16, BatchedQueryParams16);
 impl_batched_query_params!(32, BatchedQueryParams32);
+impl_batched_query_params!(64, BatchedQueryParams64);
+impl_batched_query_params!(128, BatchedQueryParams128);
+impl_batched_query_params!(256, BatchedQueryParams256);
+impl_batched_query_params!(512, BatchedQueryParams512);
+impl_batched_query_params!(1024, BatchedQueryParams1024);
+
+impl_batched_api!(2, BatchedQuery2, BatchedResponse2, respond_batched_2, eval_batched_2);
+impl_batched_api!(4, BatchedQuery4, BatchedResponse4, respond_batched_4, eval_batched_4);
+impl_batched_api!(8, BatchedQuery8, BatchedResponse8, respond_batched_8, eval_batched_8);
+impl_batched_api!(16, BatchedQuery16, BatchedResponse16, respond_batched_16, eval_batched_16);
+impl_batched_api!(32, BatchedQuery32, BatchedResponse32, respond_batched_32, eval_batched_32);
+impl_batched_api!(64, BatchedQuery64, BatchedResponse64, respond_batched_64, eval_batched_64);
+impl_batched_api!(128, BatchedQuery128, BatchedResponse128, respond_batched_128, eval_batched_128);
+impl_batched_api!(256, BatchedQuery256, BatchedResponse256, respond_batched_256, eval_batched_256);
+impl_batched_api!(512, BatchedQuery512, BatchedResponse512, respond_batched_512, eval_batched_512);
+impl_batched_api!(1024, BatchedQuery1024, BatchedResponse1024, respond_batched_1024, eval_batched_1024);
 
 #[cfg(test)]
 mod tests {
@@ -599,10 +684,48 @@ mod tests {
     BatchedResponse32,
     respond_batched_32
   );
+  test_batch_size!(
+    test_batched_queries_64,
+    64,
+    BatchedQuery64,
+    BatchedResponse64,
+    respond_batched_64
+  );
+  test_batch_size!(test_batched_queries_128,
+    128,
+    BatchedQuery128,
+     BatchedResponse128,
+     respond_batched_128
+   );
+  test_batch_size!(
+    test_batched_queries_256,
+    256,
+    BatchedQuery256,
+    BatchedResponse256,
+    respond_batched_256
+  );
+  test_batch_size!(test_batched_queries_512,
+    512,
+     BatchedQuery512,
+     BatchedResponse512,
+     respond_batched_512
+   );
+  test_batch_size!(
+    test_batched_queries_1024,
+    1024,
+    BatchedQuery1024,
+    BatchedResponse1024,
+     respond_batched_1024
+   );
 
   test_client_batch_size!(test_client_batch_2, 2, BatchedQueryParams2);
   test_client_batch_size!(test_client_batch_4, 4, BatchedQueryParams4);
   test_client_batch_size!(test_client_batch_8, 8, BatchedQueryParams8);
   test_client_batch_size!(test_client_batch_16, 16, BatchedQueryParams16);
   test_client_batch_size!(test_client_batch_32, 32, BatchedQueryParams32);
+  test_client_batch_size!(test_client_batch_64, 64, BatchedQueryParams64);
+  test_client_batch_size!(test_client_batch_128, 128, BatchedQueryParams128);
+  test_client_batch_size!(test_client_batch_256, 256, BatchedQueryParams256);
+  test_client_batch_size!(test_client_batch_512, 512, BatchedQueryParams512);
+  test_client_batch_size!(test_client_batch_1024, 1024, BatchedQueryParams1024);
 }

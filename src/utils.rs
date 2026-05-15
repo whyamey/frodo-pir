@@ -136,18 +136,19 @@ pub mod matrices {
     row
   }
 
-  /// Takes a matrix in row format, and returns it flattened in column-major format
-  pub fn flatten_matrix_col_major(matrix: &[Vec<u32>]) -> Vec<u32> {
+  /// Takes a matrix in row format, and returns it flattened in row-major format
+  pub fn flatten_matrix_row_major(matrix: &[Vec<u32>]) -> Vec<u32> {
     if matrix.is_empty() {
       return Vec::new();
     }
     let height = matrix.len();
     let width = matrix[0].len();
 
-    (0..width)
-      .into_par_iter()
-      .flat_map_iter(|col| (0..height).map(move |row| matrix[row][col]))
-      .collect()
+    let mut flat = Vec::with_capacity(height * width);
+    for row in matrix {
+      flat.extend_from_slice(row);
+    }
+    flat
   }
 }
 
